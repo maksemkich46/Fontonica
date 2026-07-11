@@ -1,0 +1,6 @@
+{
+  "name": "Fontonica",
+  "description": "Premium Material Design 3 app to replace Roblox APK fonts and sign the modified APK with a single tap.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
