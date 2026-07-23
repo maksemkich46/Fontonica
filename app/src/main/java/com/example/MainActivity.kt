@@ -64,6 +64,7 @@ import java.util.jar.Attributes
 import java.util.jar.Manifest
 import java.util.zip.CRC32
 import java.util.zip.ZipEntry
+import java.util.zip.ZipFile
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
 
@@ -188,11 +189,75 @@ fun FontonicaDashboard(isDark: Boolean, modifier: Modifier = Modifier) {
 
     // Signing state
     var isSigning by remember { mutableStateOf(false) }
+    var signingJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+    var isConsoleExpanded by remember { mutableStateOf(false) }
     val signingLogs = remember { mutableStateListOf<String>() }
     var currentStep by remember { mutableStateOf("") }
     var signedApkFile by remember { mutableStateOf<File?>(null) }
     var signingError by remember { mutableStateOf<String?>(null) }
     var fontSearchQuery by remember { mutableStateOf("") }
+
+    // One-time font size warning dialog state
+    var showFontSizeWarningDialog by remember { mutableStateOf(false) }
+    var pendingSigningAction by remember { mutableStateOf<(() -> Unit)?>(null) }
+    val prefs = remember { context.getSharedPreferences("fontonica_prefs", Context.MODE_PRIVATE) }
+
+    val triggerSigningAction = {
+        val executeBuild = {
+            isSigning = true
+            signedApkFile = null
+            signingError = null
+            signingLogs.clear()
+            signingJob = scope.launch {
+                var lastLogMessage = "Произошла неизвестная ошибка при сборке."
+                try {
+                    val result = withContext(Dispatchers.IO) {
+                        runSigningProcess(
+                            context = context,
+                            fontFile = selectedFont!!.file,
+                            apkUri = selectedApkUri!!,
+                            isExtendedMode = (replacementMode == "extended"),
+                            allFontFiles = apkDetails?.fontFiles ?: emptyList()
+                        ) { log, step ->
+                            scope.launch {
+                                signingLogs.add(log)
+                                currentStep = step
+                                if (log.startsWith("[ОШИБКА]:")) {
+                                    lastLogMessage = log.removePrefix("[ОШИБКА]:").trim()
+                                }
+                            }
+                        }
+                    }
+                    isSigning = false
+                    signingJob = null
+                    if (result != null) {
+                        signedApkFile = result
+                        Toast.makeText(context, "Сборка завершена!", Toast.LENGTH_SHORT).show()
+                    } else {
+                        signingError = lastLogMessage
+                        Toast.makeText(context, "Сборка завершилась с ошибкой.", Toast.LENGTH_LONG).show()
+                    }
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    isSigning = false
+                    signingJob = null
+                    currentStep = "Отменено пользователем"
+                    signingLogs.add("[ОТМЕНА]: Замена шрифта была отменена пользователем.")
+                    Toast.makeText(context, "Замена шрифта отменена", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+
+        val hasSeenWarning = prefs.getBoolean("has_seen_font_size_warning", false)
+        if (!hasSeenWarning) {
+            pendingSigningAction = {
+                prefs.edit().putBoolean("has_seen_font_size_warning", true).apply()
+                executeBuild()
+            }
+            showFontSizeWarningDialog = true
+        } else {
+            executeBuild()
+        }
+    }
 
     // Launcher for Font Selection
     val fontPickerLauncher = rememberLauncherForActivityResult(
@@ -331,7 +396,7 @@ fun FontonicaDashboard(isDark: Boolean, modifier: Modifier = Modifier) {
                                     .padding(horizontal = 8.dp, vertical = 2.dp)
                             ) {
                                 Text(
-                                    text = "v2.1.1",
+                                    text = "v2.7",
                                     fontSize = 11.sp,
                                     fontWeight = FontWeight.Bold,
                                     color = MaterialTheme.colorScheme.onSecondaryContainer
@@ -365,9 +430,9 @@ fun FontonicaDashboard(isDark: Boolean, modifier: Modifier = Modifier) {
         val errorBg = if (isDark) Color(0xFF2D1616) else Color(0xFFFFEBEE)
         val errorBorder = if (isDark) Color(0xFFC62828).copy(alpha = 0.6f) else Color(0xFFF44336).copy(alpha = 0.4f)
 
-        val successCardBg = if (isDark) successBg.copy(alpha = 0.15f) else successBg.copy(alpha = 0.4f)
+        val successCardBg = if (isDark) successBg.copy(alpha = 0.15f) else Color(0xFFF4FBF4)
 
-        val fontCardBorderColor = if (step1Completed) successColor.copy(alpha = 0.4f) else MaterialTheme.colorScheme.primary.copy(alpha = 0.25f)
+        val fontCardBorderColor = if (step1Completed) (if (isDark) successColor.copy(alpha = 0.4f) else Color(0xFFA5D6A7)) else MaterialTheme.colorScheme.primary.copy(alpha = 0.2f)
         Card(
             modifier = Modifier.fillMaxWidth(),
             elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
@@ -632,46 +697,6 @@ fun FontonicaDashboard(isDark: Boolean, modifier: Modifier = Modifier) {
                                 )
                             }
 
-                            // Preset filter pills
-                            val presets = listOf(
-                                "✨ Стандарт" to "Съешь ещё этих мягких французских булок, да выпей чаю! ABC 123",
-                                "💬 Чат Roblox" to "[Guest_8293]: OMG! This font looks absolutely incredible in-game!",
-                                "🎮 Никнейм" to "⚡_RobloxMaster_⚡ [VIP] Level 100",
-                                "🔢 Цифры" to "0 1 2 3 4 5 6 7 8 9 (XP +450, HP -12)"
-                            )
-                            Row(
-                                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .horizontalScroll(rememberScrollState())
-                            ) {
-                                presets.forEach { (label, text) ->
-                                    val isSelected = previewText == text
-                                    Box(
-                                        modifier = Modifier
-                                            .clip(RoundedCornerShape(20.dp))
-                                            .background(
-                                                if (isSelected) MaterialTheme.colorScheme.primaryContainer
-                                                else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
-                                            )
-                                            .clickable { previewText = text }
-                                            .border(
-                                                width = 1.dp,
-                                                color = if (isSelected) MaterialTheme.colorScheme.primary else Color.Transparent,
-                                                shape = RoundedCornerShape(20.dp)
-                                            )
-                                            .padding(horizontal = 12.dp, vertical = 6.dp)
-                                    ) {
-                                        Text(
-                                            text = label,
-                                            style = MaterialTheme.typography.labelSmall,
-                                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
-                                            color = if (isSelected) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant
-                                        )
-                                    }
-                                }
-                            }
-
                             // Text Field to type custom text
                             OutlinedTextField(
                                 value = previewText,
@@ -733,7 +758,7 @@ fun FontonicaDashboard(isDark: Boolean, modifier: Modifier = Modifier) {
         }
 
         // Section 2: Roblox APK file selection
-        val apkCardBorderColor = if (step2Completed) successColor.copy(alpha = 0.4f) else if (step1Completed) MaterialTheme.colorScheme.primary.copy(alpha = 0.25f) else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.2f)
+        val apkCardBorderColor = if (step2Completed) (if (isDark) successColor.copy(alpha = 0.4f) else Color(0xFFA5D6A7)) else if (step1Completed) MaterialTheme.colorScheme.primary.copy(alpha = 0.2f) else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.15f)
         Card(
             modifier = Modifier.fillMaxWidth(),
             elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
@@ -1105,7 +1130,7 @@ fun FontonicaDashboard(isDark: Boolean, modifier: Modifier = Modifier) {
         }
 
         // Section 3: Выбор режима замены
-        val modeCardBorderColor = if (step2Completed) successColor.copy(alpha = 0.4f) else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.2f)
+        val modeCardBorderColor = if (step2Completed) (if (isDark) successColor.copy(alpha = 0.4f) else Color(0xFFA5D6A7)) else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.15f)
         Card(
             modifier = Modifier.fillMaxWidth(),
             elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
@@ -1299,108 +1324,6 @@ fun FontonicaDashboard(isDark: Boolean, modifier: Modifier = Modifier) {
                                 }
                             }
                         }
-
-                        // INLINE COMPARISON MATRIX: В чем разница?
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .background(
-                                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = if (isDark) 0.15f else 0.35f),
-                                    shape = RoundedCornerShape(12.dp)
-                                )
-                                .border(
-                                    width = 1.dp,
-                                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f),
-                                    shape = RoundedCornerShape(12.dp)
-                                )
-                                .padding(12.dp),
-                            verticalArrangement = Arrangement.spacedBy(10.dp)
-                        ) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.Info,
-                                    contentDescription = null,
-                                    tint = MaterialTheme.colorScheme.primary,
-                                    modifier = Modifier.size(16.dp)
-                                )
-                                Text(
-                                    text = "Какая разница между режимами?",
-                                    style = MaterialTheme.typography.labelMedium,
-                                    fontWeight = FontWeight.Bold,
-                                    color = MaterialTheme.colorScheme.primary
-                                )
-                            }
-
-                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
-
-                            // Rows of the matrix
-                            val matrixItems = listOf(
-                                Triple(
-                                    "Область замены",
-                                    "Заменяет 73 встроенных файла шрифтов в APK.",
-                                    "Встроенные шрифты + модифицирует облачные JSON-схемы."
-                                ),
-                                Triple(
-                                    "Эффект в игре",
-                                    "Меняет системные меню, классический игровой чат и базовые UI.",
-                                    "Дополнительно перенаправляет облачные шрифты rbxassetid:// на ваш."
-                                ),
-                                Triple(
-                                    "Стабильность",
-                                    "⚡ 100% совместимость, минимальное вмешательство в логику.",
-                                    "🛠 Экспериментально (иногда в плейсах с кастомным UI шрифты сбрасываются)."
-                                )
-                            )
-
-                            matrixItems.forEach { (feature, standardDesc, extendedDesc) ->
-                                Column(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    verticalArrangement = Arrangement.spacedBy(4.dp)
-                                ) {
-                                    Text(
-                                        text = feature,
-                                        style = MaterialTheme.typography.labelSmall,
-                                        fontWeight = FontWeight.Bold,
-                                        color = MaterialTheme.colorScheme.onSurface
-                                    )
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.spacedBy(12.dp)
-                                    ) {
-                                        Column(modifier = Modifier.weight(1f)) {
-                                            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                                                Text("•", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 11.sp)
-                                                Text(
-                                                    text = standardDesc,
-                                                    style = MaterialTheme.typography.bodySmall,
-                                                    fontSize = 11.sp,
-                                                    lineHeight = 14.sp,
-                                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                                )
-                                            }
-                                        }
-                                        Column(modifier = Modifier.weight(1f)) {
-                                            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                                                Text("•", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary, fontSize = 11.sp)
-                                                Text(
-                                                    text = extendedDesc,
-                                                    style = MaterialTheme.typography.bodySmall,
-                                                    fontSize = 11.sp,
-                                                    lineHeight = 14.sp,
-                                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                                )
-                                            }
-                                        }
-                                    }
-                                }
-                                if (feature != matrixItems.last().first) {
-                                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.2f), modifier = Modifier.padding(vertical = 2.dp))
-                                }
-                            }
-                        }
                     }
                 }
             }
@@ -1494,74 +1417,111 @@ fun FontonicaDashboard(isDark: Boolean, modifier: Modifier = Modifier) {
                 }
 
                 if (isSigning) {
-                    Column(
+                    Card(
                         modifier = Modifier.fillMaxWidth(),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                        shape = RoundedCornerShape(16.dp),
+                        colors = CardDefaults.cardColors(
+                            containerColor = if (isDark) MaterialTheme.colorScheme.surfaceContainerHigh else MaterialTheme.colorScheme.surface
+                        ),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.25f))
                     ) {
-                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-                        Text(
-                            text = currentStep,
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.primary,
-                            fontSize = 14.sp
-                        )
-
-                        // Logs terminal block
                         Column(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .background(Color(0xFF151515), RoundedCornerShape(12.dp))
-                                .border(1.dp, Color(0xFF333333), RoundedCornerShape(12.dp))
-                                .padding(8.dp)
+                                .padding(20.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(16.dp)
                         ) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(44.dp),
+                                color = MaterialTheme.colorScheme.primary,
+                                strokeWidth = 4.dp
+                            )
+
+                            Column(
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.spacedBy(4.dp)
                             ) {
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                                ) {
-                                    Box(
-                                        modifier = Modifier
-                                            .size(8.dp)
-                                            .background(Color(0xFF00FF00), RoundedCornerShape(50))
-                                    )
+                                Text(
+                                    text = "Замена шрифта...",
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 16.sp,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                                if (currentStep.isNotEmpty()) {
                                     Text(
-                                        text = "КОНСОЛЬ СБОРКИ (ПРОЦЕСС...)",
-                                        color = Color(0xFF9E9E9E),
-                                        fontFamily = FontFamily.Monospace,
-                                        fontSize = 11.sp,
-                                        fontWeight = FontWeight.Bold
+                                        text = currentStep,
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        textAlign = TextAlign.Center
                                     )
                                 }
                             }
 
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(150.dp)
+                            // Notice that the process may take time
+                            Surface(
+                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                                shape = RoundedCornerShape(12.dp),
+                                border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
                             ) {
-                                val scrollState = rememberScrollState()
-                                LaunchedEffect(signingLogs.size) {
-                                    scrollState.animateScrollTo(scrollState.maxValue)
-                                }
-                                Column(
+                                Row(
                                     modifier = Modifier
-                                        .fillMaxSize()
-                                        .verticalScroll(scrollState),
-                                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                                        .fillMaxWidth()
+                                        .padding(12.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(10.dp)
                                 ) {
-                                    signingLogs.forEach { log ->
-                                        Text(
-                                            text = log,
-                                            fontFamily = FontFamily.Monospace,
-                                            fontSize = 11.sp,
-                                            color = if (log.contains("[ОШИБКА]")) Color(0xFFFF5252) else Color(0xFF00FF00)
-                                        )
-                                    }
+                                    Icon(
+                                        imageVector = Icons.Default.Schedule,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                    Text(
+                                        text = "Процесс замены шрифта и переподписи может занять некоторое время. Пожалуйста, не закрывайте приложение.",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        fontSize = 12.sp,
+                                        lineHeight = 16.sp
+                                    )
                                 }
+                            }
+
+                            ExpandableConsole(
+                                signingLogs = signingLogs,
+                                isExpanded = isConsoleExpanded,
+                                onToggleExpand = { isConsoleExpanded = !isConsoleExpanded },
+                                isDark = isDark,
+                                context = context
+                            )
+
+                            // Cancel button
+                            OutlinedButton(
+                                onClick = {
+                                    signingJob?.cancel()
+                                    signingJob = null
+                                    isSigning = false
+                                    currentStep = "Отменено пользователем"
+                                    signingLogs.add("[ОТМЕНА]: Замена шрифта была отменена пользователем.")
+                                    Toast.makeText(context, "Замена отменена", Toast.LENGTH_SHORT).show()
+                                },
+                                modifier = Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(12.dp),
+                                border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.error.copy(alpha = 0.5f)),
+                                colors = ButtonDefaults.outlinedButtonColors(
+                                    contentColor = MaterialTheme.colorScheme.error
+                                )
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Close,
+                                    contentDescription = "Отмена",
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = "Отменить замену",
+                                    fontWeight = FontWeight.Bold
+                                )
                             }
                         }
                     }
@@ -1651,112 +1611,16 @@ fun FontonicaDashboard(isDark: Boolean, modifier: Modifier = Modifier) {
                                     )
                                 }
 
-                                // Logs terminal box with Copy Button
-                                Column(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .background(Color(0xFF151515), RoundedCornerShape(12.dp))
-                                        .border(1.dp, Color(0xFF333333), RoundedCornerShape(12.dp))
-                                        .padding(8.dp)
-                                ) {
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp),
-                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Text(
-                                            text = "ЛОГИ СБОРКИ (ДЕТАЛИ ОШИБКИ):",
-                                            color = Color(0xFF9E9E9E),
-                                            fontFamily = FontFamily.Monospace,
-                                            fontSize = 11.sp,
-                                            fontWeight = FontWeight.Bold
-                                        )
-                                        
-                                        if (signingLogs.isNotEmpty()) {
-                                            Text(
-                                                text = "Скопировать логи",
-                                                color = MaterialTheme.colorScheme.primary,
-                                                fontFamily = FontFamily.Monospace,
-                                                fontSize = 11.sp,
-                                                fontWeight = FontWeight.Bold,
-                                                modifier = Modifier
-                                                    .clickable {
-                                                        try {
-                                                            val clipboardManager = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-                                                            val clip = android.content.ClipData.newPlainText("Fontonica Logs", signingLogs.joinToString("\n"))
-                                                            clipboardManager.setPrimaryClip(clip)
-                                                            Toast.makeText(context, "Логи скопированы!", Toast.LENGTH_SHORT).show()
-                                                        } catch (e: Exception) {
-                                                            Toast.makeText(context, "Ошибка копирования: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
-                                                        }
-                                                    }
-                                                    .padding(4.dp)
-                                            )
-                                        }
-                                    }
-
-                                    Box(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .height(150.dp)
-                                    ) {
-                                        val scrollState = rememberScrollState()
-                                        LaunchedEffect(signingLogs.size) {
-                                            scrollState.animateScrollTo(scrollState.maxValue)
-                                        }
-                                        Column(
-                                            modifier = Modifier
-                                                .fillMaxSize()
-                                                .verticalScroll(scrollState),
-                                            verticalArrangement = Arrangement.spacedBy(4.dp)
-                                        ) {
-                                            signingLogs.forEach { log ->
-                                                Text(
-                                                    text = log,
-                                                    fontFamily = FontFamily.Monospace,
-                                                    fontSize = 11.sp,
-                                                    color = if (log.contains("[ОШИБКА]")) Color(0xFFFF5252) else Color(0xFF00FF00)
-                                                )
-                                            }
-                                        }
-                                    }
-                                }
+                                ExpandableConsole(
+                                    signingLogs = signingLogs,
+                                    isExpanded = isConsoleExpanded,
+                                    onToggleExpand = { isConsoleExpanded = !isConsoleExpanded },
+                                    isDark = isDark,
+                                    context = context
+                                )
 
                                 Button(
-                                    onClick = {
-                                        isSigning = true
-                                        signedApkFile = null
-                                        signingError = null
-                                        signingLogs.clear()
-                                        scope.launch {
-                                            var lastLogMessage = "Произошла неизвестная ошибка при сборке."
-                                            val result = withContext(Dispatchers.IO) {
-                                                runSigningProcess(
-                                                    context = context,
-                                                    fontFile = selectedFont!!.file,
-                                                    apkUri = selectedApkUri!!,
-                                                    isExtendedMode = (replacementMode == "extended"),
-                                                    allFontFiles = apkDetails?.fontFiles ?: emptyList()
-                                                ) { log, step ->
-                                                    scope.launch {
-                                                        signingLogs.add(log)
-                                                        currentStep = step
-                                                        if (log.startsWith("[ОШИБКА]:")) {
-                                                            lastLogMessage = log.removePrefix("[ОШИБКА]:").trim()
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            isSigning = false
-                                            if (result != null) {
-                                                signedApkFile = result
-                                                Toast.makeText(context, "Сборка завершена!", Toast.LENGTH_SHORT).show()
-                                            } else {
-                                                signingError = lastLogMessage
-                                                Toast.makeText(context, "Сборка завершилась с ошибкой.", Toast.LENGTH_LONG).show()
-                                            }
-                                        }
-                                    },
+                                    onClick = { triggerSigningAction() },
                                     enabled = isButtonEnabled,
                                     modifier = Modifier.fillMaxWidth().height(48.dp),
                                     colors = ButtonDefaults.buttonColors(
@@ -1771,40 +1635,7 @@ fun FontonicaDashboard(isDark: Boolean, modifier: Modifier = Modifier) {
                             }
                         } else {
                             Button(
-                                onClick = {
-                                    isSigning = true
-                                    signedApkFile = null
-                                    signingError = null
-                                    signingLogs.clear()
-                                    scope.launch {
-                                        var lastLogMessage = "Произошла неизвестная ошибка при сборке."
-                                        val result = withContext(Dispatchers.IO) {
-                                            runSigningProcess(
-                                                context = context,
-                                                fontFile = selectedFont!!.file,
-                                                apkUri = selectedApkUri!!,
-                                                isExtendedMode = (replacementMode == "extended"),
-                                                allFontFiles = apkDetails?.fontFiles ?: emptyList()
-                                            ) { log, step ->
-                                                scope.launch {
-                                                    signingLogs.add(log)
-                                                    currentStep = step
-                                                    if (log.startsWith("[ОШИБКА]:")) {
-                                                        lastLogMessage = log.removePrefix("[ОШИБКА]:").trim()
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        isSigning = false
-                                        if (result != null) {
-                                            signedApkFile = result
-                                            Toast.makeText(context, "Сборка завершена!", Toast.LENGTH_SHORT).show()
-                                        } else {
-                                            signingError = lastLogMessage
-                                            Toast.makeText(context, "Сборка завершилась с ошибкой.", Toast.LENGTH_LONG).show()
-                                        }
-                                    }
-                                },
+                                onClick = { triggerSigningAction() },
                                 enabled = isButtonEnabled,
                                 modifier = Modifier.fillMaxWidth().height(48.dp),
                                 colors = ButtonDefaults.buttonColors(
@@ -1821,6 +1652,55 @@ fun FontonicaDashboard(isDark: Boolean, modifier: Modifier = Modifier) {
                 }
             }
         }
+    }
+
+    if (showFontSizeWarningDialog) {
+        AlertDialog(
+            onDismissRequest = {
+                showFontSizeWarningDialog = false
+                pendingSigningAction = null
+            },
+            icon = {
+                Icon(
+                    imageVector = Icons.Default.Warning,
+                    contentDescription = "Предупреждение",
+                    tint = MaterialTheme.colorScheme.primary
+                )
+            },
+            title = {
+                Text(
+                    text = "Предупреждение о размере шрифта",
+                    fontWeight = FontWeight.Bold
+                )
+            },
+            text = {
+                Text(
+                    text = "Я осведомлён (из описания репозитория на GitHub), что при выборе сторонних шрифтов существует риск того, что их файлы могут быть больше по размеру в отличие от первоначальной нормы.",
+                    fontSize = 14.sp
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showFontSizeWarningDialog = false
+                        pendingSigningAction?.invoke()
+                        pendingSigningAction = null
+                    }
+                ) {
+                    Text("Осведомлен, продолжить")
+                }
+            },
+            dismissButton = {
+                OutlinedButton(
+                    onClick = {
+                        showFontSizeWarningDialog = false
+                        pendingSigningAction = null
+                    }
+                ) {
+                    Text("Отмена")
+                }
+            }
+        )
     }
 }
 
@@ -1952,26 +1832,36 @@ fun runSigningProcess(
     allFontFiles: List<String>,
     logger: (String, String) -> Unit
 ): File? {
+    val tempInputApk = File(context.cacheDir, "fontonica_input.apk")
     val tempUnsignedApk = File(context.cacheDir, "fontonica_unsigned.apk")
     val tempOutApk = File(context.cacheDir, "fontonica_output.apk")
     
-    if (tempUnsignedApk.exists()) {
-        tempUnsignedApk.delete()
-    }
-    if (tempOutApk.exists()) {
-        tempOutApk.delete()
-    }
+    if (tempInputApk.exists()) tempInputApk.delete()
+    if (tempUnsignedApk.exists()) tempUnsignedApk.delete()
+    if (tempOutApk.exists()) tempOutApk.delete()
 
     try {
         logger("[Fontonica] Начинается обработка...", "Инициализация...")
         
-        // 1. Generate key pair and certificate
-        logger("[1/3] Генерация приватного ключа и самоподписанного сертификата...", "Генерация подписи...")
+        // 1. Copy source APK from Uri to local temporary file for memory-efficient ZipFile streaming
+        logger("[1/3] Чтение оригинального APK...", "Подготовка...")
+        context.contentResolver.openInputStream(apkUri)?.use { input ->
+            FileOutputStream(tempInputApk).use { output ->
+                val buffer = ByteArray(64 * 1024)
+                var readLen: Int
+                while (input.read(buffer, 0, buffer.size).also { readLen = it } != -1) {
+                    output.write(buffer, 0, readLen)
+                }
+            }
+        } ?: throw IOException("Не удалось открыть исходный APK-файл.")
+
+        // 2. Generate key pair and certificate
+        logger("[2/3] Генерация релизного RSA ключа и X.509 сертификата (Fontonica v2.7)...", "Генерация релизной подписи...")
         val keyGen = KeyPairGenerator.getInstance("RSA")
         keyGen.initialize(2048)
         val keyPair = keyGen.generateKeyPair()
 
-        val issuer = X500Name("CN=Fontonica, O=Fontonica, C=US")
+        val issuer = X500Name("CN=Fontonica Official Release v2.7, OU=Fontonica Production, O=Fontonica Inc, C=US")
         val serial = BigInteger.valueOf(System.currentTimeMillis())
         val notBefore = Date(System.currentTimeMillis() - 1000L * 60 * 60 * 24 * 365)
         val notAfter = Date(System.currentTimeMillis() + 1000L * 60 * 60 * 24 * 365 * 10)
@@ -1991,193 +1881,218 @@ fun runSigningProcess(
         val certificate = CertificateFactory.getInstance("X.509")
             .generateCertificate(ByteArrayInputStream(holder.encoded)) as X509Certificate
         
-        logger("[Fontonica] Ключ подписи сгенерирован.", "Сборка...")
+        logger("[Fontonica] Релизный ключ подписи v2.7 сгенерирован.", "Сборка...")
 
         // Read font file bytes once
         val fontBytes = fontFile.readBytes()
 
-        // 2. Open input stream and output stream for unsigned ZIP
-        logger("[2/3] Чтение оригинального APK и замена шрифтов...", "Копирование и модификация файлов...")
+        // 3. Process ZIP using stream buffers (prevents OutOfMemory on large native libraries)
+        logger("[3/3] Замена шрифтов и модификация APK...", "Копирование и модификация файлов...")
 
-        context.contentResolver.openInputStream(apkUri)?.use { apkInputStream ->
-            ZipInputStream(apkInputStream).use { zis ->
-                val fos = FileOutputStream(tempUnsignedApk)
-                val bos = BufferedOutputStream(fos)
-                val cos = CountingOutputStream(bos)
-                ZipOutputStream(cos).use { zos ->
-                    val newFontsToCreate = mutableSetOf<String>()
-                    val writtenEntries = mutableSetOf<String>()
+        ZipFile(tempInputApk).use { zipFile ->
+            FileOutputStream(tempUnsignedApk).use { fos ->
+                BufferedOutputStream(fos).use { bos ->
+                    val cos = CountingOutputStream(bos)
+                    ZipOutputStream(cos).use { zos ->
+                        val newFontsToCreate = mutableSetOf<String>()
+                        val writtenEntries = mutableSetOf<String>()
+                        val streamBuffer = ByteArray(64 * 1024)
 
-                    var entry: ZipEntry? = zis.nextEntry
-                    while (entry != null) {
-                        val name = entry.name
+                        val entries = zipFile.entries()
+                        while (entries.hasMoreElements()) {
+                            val entry = entries.nextElement()
+                            val name = entry.name
 
-                        // Skip directory entries and existing signature files
-                        val isSignatureFile = name.startsWith("META-INF/") && (
-                                name.endsWith(".SF") || 
-                                name.endsWith(".RSA") || 
-                                name.endsWith(".DSA") || 
-                                name.endsWith(".EC") || 
-                                name == "META-INF/MANIFEST.MF"
-                        )
+                            // Skip directory entries and existing signature files
+                            val isSignatureFile = name.startsWith("META-INF/") && (
+                                    name.endsWith(".SF") || 
+                                    name.endsWith(".RSA") || 
+                                    name.endsWith(".DSA") || 
+                                    name.endsWith(".EC") || 
+                                    name == "META-INF/MANIFEST.MF"
+                            )
 
-                        if (!entry.isDirectory && !isSignatureFile) {
-                            val normalizedName = name.lowercase()
-                            if (!writtenEntries.contains(normalizedName)) {
-                                writtenEntries.add(normalizedName)
+                            if (!entry.isDirectory && !isSignatureFile) {
+                                val normalizedName = name.lowercase()
+                                if (!writtenEntries.contains(normalizedName)) {
+                                    writtenEntries.add(normalizedName)
 
-                                // Determine if this is a font to replace
-                                val isFontToReplace = name.startsWith("assets/content/fonts/", ignoreCase = true) && 
-                                        (name.endsWith(".ttf", ignoreCase = true) || name.endsWith(".otf", ignoreCase = true)) &&
-                                        !name.endsWith("RobloxEmoji.ttf", ignoreCase = true) && 
-                                        !name.endsWith("TwemojiMozilla.ttf", ignoreCase = true)
+                                    // Determine if this is a font to replace
+                                    val isFontToReplace = name.startsWith("assets/content/fonts/", ignoreCase = true) && 
+                                            (name.endsWith(".ttf", ignoreCase = true) || name.endsWith(".otf", ignoreCase = true)) &&
+                                            !name.endsWith("RobloxEmoji.ttf", ignoreCase = true) && 
+                                            !name.endsWith("TwemojiMozilla.ttf", ignoreCase = true)
 
-                                val isJsonToProcess = isExtendedMode &&
-                                        name.startsWith("assets/content/fonts/", ignoreCase = true) &&
-                                        name.endsWith(".json", ignoreCase = true)
+                                    val isJsonToProcess = isExtendedMode &&
+                                            name.startsWith("assets/content/fonts/", ignoreCase = true) &&
+                                            name.endsWith(".json", ignoreCase = true)
 
-                                // Read the entry's content into memory
-                                val entryBytes = if (isFontToReplace) {
-                                    logger("-> Заменен шрифт: $name", "Замена шрифтов...")
-                                    fontBytes
-                                } else if (isJsonToProcess) {
-                                    val originalBytes = zis.readBytes()
-                                    try {
-                                        val originalStr = String(originalBytes, Charsets.UTF_8)
-                                        val obj = org.json.JSONObject(originalStr)
-                                        val faces = obj.optJSONArray("faces")
-                                        var modified = false
-                                        if (faces != null) {
-                                            val directoryPrefix = name.substringBeforeLast("/") + "/"
-                                            val familyName = obj.optString("name", "").ifEmpty {
-                                                name.substringAfterLast("/").substringBeforeLast(".")
-                                            }
-                                            for (i in 0 until faces.length()) {
-                                                val face = faces.optJSONObject(i) ?: continue
-                                                val assetIdObj = face.opt("assetId")
-                                                val assetId = assetIdObj?.toString() ?: ""
-                                                val isCloudAsset = assetId.startsWith("rbxassetid://") || assetId.toLongOrNull() != null
-                                                
-                                                if (isCloudAsset) {
-                                                    val faceName = face.optString("name", "Regular")
+                                    if (isFontToReplace) {
+                                        logger("-> Заменен шрифт: $name", "Замена шрифтов...")
+                                        val newEntry = ZipEntry(name)
+                                        newEntry.method = ZipEntry.DEFLATED
+                                        zos.putNextEntry(newEntry)
+                                        zos.write(fontBytes)
+                                        zos.closeEntry()
+                                    } else if (isJsonToProcess) {
+                                        val originalBytes = zipFile.getInputStream(entry).use { it.readBytes() }
+                                        var finalBytes = originalBytes
+                                        try {
+                                            val originalStr = String(originalBytes, Charsets.UTF_8)
+                                            val obj = org.json.JSONObject(originalStr)
+                                            val faces = obj.optJSONArray("faces")
+                                            var modified = false
+                                            if (faces != null) {
+                                                val directoryPrefix = name.substringBeforeLast("/") + "/"
+                                                val familyName = obj.optString("name", "").ifEmpty {
+                                                    name.substringAfterLast("/").substringBeforeLast(".")
+                                                }
+                                                for (i in 0 until faces.length()) {
+                                                    val face = faces.optJSONObject(i) ?: continue
+                                                    val assetIdObj = face.opt("assetId")
+                                                    val assetId = assetIdObj?.toString() ?: ""
+                                                    val isCloudAsset = assetId.startsWith("rbxassetid://") || assetId.toLongOrNull() != null
+                                                    
+                                                    if (isCloudAsset) {
+                                                        val faceName = face.optString("name", "Regular")
 
-                                                    // Normalize for robust family matching (handles spaces, hyphens, underscores)
-                                                    val normalizedFamily = familyName.lowercase().replace(" ", "").replace("-", "").replace("_", "")
-                                                    val existingExtension = allFontFiles.find { f ->
-                                                        val normalizedF = f.lowercase().replace(" ", "").replace("-", "").replace("_", "")
-                                                        normalizedF.startsWith(normalizedFamily) && 
-                                                        (f.endsWith(".ttf", ignoreCase = true) || f.endsWith(".otf", ignoreCase = true))
-                                                    }?.substringAfterLast(".") ?: fontFile.extension
+                                                        // Normalize for robust family matching (handles spaces, hyphens, underscores)
+                                                        val normalizedFamily = familyName.lowercase().replace(" ", "").replace("-", "").replace("_", "")
+                                                        val existingExtension = allFontFiles.find { f ->
+                                                            val normalizedF = f.lowercase().replace(" ", "").replace("-", "").replace("_", "")
+                                                            normalizedF.startsWith(normalizedFamily) && 
+                                                            (f.endsWith(".ttf", ignoreCase = true) || f.endsWith(".otf", ignoreCase = true))
+                                                        }?.substringAfterLast(".") ?: fontFile.extension
 
-                                                    val safeFaceName = faceName.lowercase().replace(" ", "")
-                                                    val safeFamilyName = familyName.lowercase().replace(" ", "")
-                                                    val localFontFilename = "$safeFamilyName-$safeFaceName.$existingExtension"
+                                                        val safeFaceName = faceName.lowercase().replace(" ", "")
+                                                        val safeFamilyName = familyName.lowercase().replace(" ", "")
+                                                        val localFontFilename = "$safeFamilyName-$safeFaceName.$existingExtension"
 
-                                                    face.put("assetId", "rbxasset://fonts/$localFontFilename")
-                                                    newFontsToCreate.add("$directoryPrefix$localFontFilename")
-                                                    modified = true
-                                                } else if (assetId.startsWith("rbxasset://")) {
-                                                    // Duplicate/ensure existence of local fonts referenced by the JSON file
-                                                    val filename = assetId.substringAfterLast("/")
-                                                    if (filename.isNotEmpty() && (filename.endsWith(".ttf", ignoreCase = true) || filename.endsWith(".otf", ignoreCase = true))) {
-                                                        newFontsToCreate.add("$directoryPrefix$filename")
+                                                        face.put("assetId", "rbxasset://fonts/$localFontFilename")
+                                                        newFontsToCreate.add("$directoryPrefix$localFontFilename")
+                                                        modified = true
+                                                    } else if (assetId.startsWith("rbxasset://")) {
+                                                        val filename = assetId.substringAfterLast("/")
+                                                        if (filename.isNotEmpty() && (filename.endsWith(".ttf", ignoreCase = true) || filename.endsWith(".otf", ignoreCase = true))) {
+                                                            newFontsToCreate.add("$directoryPrefix$filename")
+                                                        }
                                                     }
                                                 }
                                             }
+
+                                            if (modified) {
+                                                logger("-> Изменен JSON шрифта: $name (перенаправлено на локальные ttf/otf)", "Замена ссылок в JSON...")
+                                                finalBytes = obj.toString(2).replace("\\/", "/").toByteArray(Charsets.UTF_8)
+                                            }
+                                        } catch (e: Exception) {
+                                            try {
+                                                val originalStr = String(originalBytes, Charsets.UTF_8)
+                                                val targetFontFile = if (allFontFiles.isNotEmpty()) {
+                                                    allFontFiles.find { it.endsWith("SourceSansPro-Regular.ttf", ignoreCase = true) }
+                                                        ?: allFontFiles.find { it.endsWith("gotham-regular.ttf", ignoreCase = true) }
+                                                        ?: allFontFiles.first()
+                                                } else {
+                                                    "SourceSansPro-Regular.ttf"
+                                                }
+                                                val replacedStr = originalStr.replace(Regex("rbxassetid://[0-9]+"), "rbxasset://fonts/$targetFontFile").replace("\\/", "/")
+                                                if (replacedStr != originalStr) {
+                                                    logger("-> Изменен JSON шрифта (regex): $name", "Замена ссылок в JSON...")
+                                                }
+                                                finalBytes = replacedStr.toByteArray(Charsets.UTF_8)
+                                            } catch (e2: Exception) {
+                                                finalBytes = originalBytes
+                                            }
                                         }
 
-                                        if (modified) {
-                                            logger("-> Изменен JSON шрифта: $name (перенаправлено на локальные ttf/otf)", "Замена ссылок в JSON...")
-                                            obj.toString(2).toByteArray(Charsets.UTF_8)
+                                        val newEntry = ZipEntry(name)
+                                        newEntry.method = ZipEntry.DEFLATED
+                                        zos.putNextEntry(newEntry)
+                                        zos.write(finalBytes)
+                                        zos.closeEntry()
+                                    } else {
+                                        // Streaming copy for all standard entries (native libs, assets, etc.)
+                                        val newEntry = ZipEntry(name)
+
+                                        var method = entry.method
+                                        if (method != ZipEntry.STORED && method != ZipEntry.DEFLATED) {
+                                            method = ZipEntry.DEFLATED
+                                        }
+                                        if (name == "resources.arsc") {
+                                            method = ZipEntry.STORED
+                                        }
+
+                                        if (method == ZipEntry.STORED) {
+                                            newEntry.method = ZipEntry.STORED
+                                            var entrySize = entry.size
+                                            var entryCrc = entry.crc
+                                            if (entrySize == -1L || entryCrc == -1L) {
+                                                val crc32 = CRC32()
+                                                var calculatedSize = 0L
+                                                zipFile.getInputStream(entry).use { isStream ->
+                                                    var bytesRead: Int
+                                                    while (isStream.read(streamBuffer, 0, streamBuffer.size).also { bytesRead = it } != -1) {
+                                                        crc32.update(streamBuffer, 0, bytesRead)
+                                                        calculatedSize += bytesRead
+                                                    }
+                                                }
+                                                entrySize = calculatedSize
+                                                entryCrc = crc32.value
+                                            }
+                                            newEntry.size = entrySize
+                                            newEntry.compressedSize = entrySize
+                                            newEntry.crc = entryCrc
+
+                                            val position = cos.getCount()
+                                            val nameBytesSize = name.toByteArray(Charsets.UTF_8).size
+                                            val extra = getPaddingExtraField(position, nameBytesSize, 4)
+                                            if (extra.isNotEmpty()) {
+                                                newEntry.extra = extra
+                                            }
                                         } else {
-                                            originalBytes
+                                            newEntry.method = ZipEntry.DEFLATED
                                         }
-                                    } catch (e: Exception) {
-                                        // Fallback to simple regex replacement if JSON parsing fails
-                                        try {
-                                            val originalStr = String(originalBytes, Charsets.UTF_8)
-                                            val targetFontFile = if (allFontFiles.isNotEmpty()) {
-                                                allFontFiles.find { it.endsWith("SourceSansPro-Regular.ttf", ignoreCase = true) }
-                                                    ?: allFontFiles.find { it.endsWith("gotham-regular.ttf", ignoreCase = true) }
-                                                    ?: allFontFiles.first()
-                                            } else {
-                                                "SourceSansPro-Regular.ttf"
+
+                                        zos.putNextEntry(newEntry)
+                                        zipFile.getInputStream(entry).use { isStream ->
+                                            var bytesRead: Int
+                                            while (isStream.read(streamBuffer, 0, streamBuffer.size).also { bytesRead = it } != -1) {
+                                                zos.write(streamBuffer, 0, bytesRead)
                                             }
-                                            val replacedStr = originalStr.replace(Regex("rbxassetid://[0-9]+"), "rbxasset://fonts/$targetFontFile")
-                                            if (replacedStr != originalStr) {
-                                                logger("-> Изменен JSON шрифта (regex): $name", "Замена ссылок в JSON...")
-                                            }
-                                            replacedStr.toByteArray(Charsets.UTF_8)
-                                        } catch (e2: Exception) {
-                                            originalBytes
                                         }
+                                        zos.closeEntry()
                                     }
-                                } else {
-                                    zis.readBytes()
                                 }
-
-                                val newEntry = ZipEntry(name)
-
-                                // Determine compression method
-                                var method = entry.method
-                                if (method != ZipEntry.STORED && method != ZipEntry.DEFLATED) {
-                                    method = ZipEntry.DEFLATED
-                                }
-                                if (name == "resources.arsc") {
-                                    method = ZipEntry.STORED
-                                }
-
-                                if (method == ZipEntry.STORED) {
-                                    val crc32 = CRC32()
-                                    crc32.update(entryBytes)
-                                    newEntry.method = ZipEntry.STORED
-                                    newEntry.size = entryBytes.size.toLong()
-                                    newEntry.compressedSize = entryBytes.size.toLong()
-                                    newEntry.crc = crc32.value
-
-                                    // Align uncompressed entry to 4-byte boundary
-                                    val position = cos.getCount()
-                                    val nameBytesSize = name.toByteArray(Charsets.UTF_8).size
-                                    val extra = getPaddingExtraField(position, nameBytesSize, 4)
-                                    if (extra.isNotEmpty()) {
-                                        newEntry.extra = extra
-                                    }
-                                } else {
-                                    newEntry.method = ZipEntry.DEFLATED
-                                }
-
-                                // Write to output ZIP
-                                zos.putNextEntry(newEntry)
-                                zos.write(entryBytes)
-                                zos.closeEntry()
                             }
                         }
-                        entry = zis.nextEntry
-                    }
 
-                    // Write newly duplicated local font files
-                    for (newFontPath in newFontsToCreate) {
-                        val normalized = newFontPath.lowercase()
-                        if (!writtenEntries.contains(normalized)) {
-                            writtenEntries.add(normalized)
-                            logger("-> Создан файл дубликата шрифта в APK: $newFontPath", "Добавление новых шрифтов...")
+                        // Write newly duplicated local font files
+                        for (newFontPath in newFontsToCreate) {
+                            val normalized = newFontPath.lowercase()
+                            if (!writtenEntries.contains(normalized)) {
+                                writtenEntries.add(normalized)
+                                logger("-> Создан файл дубликата шрифта в APK: $newFontPath", "Добавление новых шрифтов...")
 
-                            val newEntry = ZipEntry(newFontPath)
-                            newEntry.method = ZipEntry.DEFLATED
-                            zos.putNextEntry(newEntry)
-                            zos.write(fontBytes)
-                            zos.closeEntry()
+                                val newEntry = ZipEntry(newFontPath)
+                                newEntry.method = ZipEntry.DEFLATED
+                                zos.putNextEntry(newEntry)
+                                zos.write(fontBytes)
+                                zos.closeEntry()
+                            }
                         }
                     }
                 }
             }
         }
 
-        // 3. Perform official V1 + V2 + V3 signing using Google's ApkSigner
-        logger("[3/3] Подписание APK (схемы подписи V1 + V2 + V3)...", "Запуск ApkSigner...")
+        // Clean up input APK temp file to free disk space before signing
+        if (tempInputApk.exists()) tempInputApk.delete()
+        System.gc()
+
+        // 4. Perform official V1 + V2 + V3 release signing using Google's ApkSigner
+        logger("[4/4] Подписание APK релизной подписью Fontonica v2.7 (схемы V1 + V2 + V3)...", "Запуск ApkSigner...")
         
         val signerConfig = com.android.apksig.ApkSigner.SignerConfig.Builder(
-            "cert",
+            "FontonicaRelease",
             keyPair.private,
             listOf(certificate)
         ).build()
@@ -2193,19 +2108,20 @@ fun runSigningProcess(
         apkSigner.sign()
 
         // Clean up temporary unsigned file
-        if (tempUnsignedApk.exists()) {
-            tempUnsignedApk.delete()
-        }
+        if (tempUnsignedApk.exists()) tempUnsignedApk.delete()
 
         // Diagnostic analysis of signed APK alignment
         analyzeApkAlignment(tempOutApk, logger)
 
         logger("[Fontonica] Готово! APK успешно модифицирован и подписан.", "Завершено!")
         return tempOutApk
-    } catch (e: Exception) {
-        logger("[ОШИБКА]: ${e.localizedMessage}", "Ошибка")
+    } catch (e: Throwable) {
+        logger("[ОШИБКА]: ${e.localizedMessage ?: e.toString()}", "Ошибка")
         e.printStackTrace()
         return null
+    } finally {
+        if (tempInputApk.exists()) tempInputApk.delete()
+        if (tempUnsignedApk.exists()) tempUnsignedApk.delete()
     }
 }
 
@@ -2265,61 +2181,201 @@ fun getPaddingExtraField(position: Long, filenameLength: Int, alignment: Int = 4
     return extra
 }
 
-// Diagnostic parser to check alignment of entries in signed APK
+// Diagnostic parser to check alignment of entries in signed APK safely without loading entire APK into memory
 fun analyzeApkAlignment(apkFile: File, logger: (String, String) -> Unit) {
     try {
         logger("[Диагностика] Анализ выравнивания подписанного APK...", "Диагностика...")
-        val bytes = apkFile.readBytes()
-        var offset = 0
-        val size = bytes.size
-        var count = 0
-        
-        while (offset < size - 30) {
-            // Check for Local File Header Signature: 0x04034b50 (little endian: 50 4b 03 04)
-            if (bytes[offset] == 0x50.toByte() && 
-                bytes[offset + 1] == 0x4b.toByte() && 
-                bytes[offset + 2] == 0x03.toByte() && 
-                bytes[offset + 3] == 0x04.toByte()) {
-                
-                val method = (bytes[offset + 8].toInt() and 0xff) or ((bytes[offset + 9].toInt() and 0xff) shl 8)
-                val compressedSize = (bytes[offset + 18].toLong() and 0xff) or 
-                                     ((bytes[offset + 19].toLong() and 0xff) shl 8) or 
-                                     ((bytes[offset + 20].toLong() and 0xff) shl 16) or 
-                                     ((bytes[offset + 21].toLong() and 0xff) shl 24)
-                                     
-                val filenameLen = (bytes[offset + 26].toInt() and 0xff) or ((bytes[offset + 27].toInt() and 0xff) shl 8)
-                val extraLen = (bytes[offset + 28].toInt() and 0xff) or ((bytes[offset + 29].toInt() and 0xff) shl 8)
-                
-                if (offset + 30 + filenameLen > size) break
-                val filename = String(bytes, offset + 30, filenameLen, Charsets.UTF_8)
-                val dataOffset = offset + 30 + filenameLen + extraLen
-                
-                if (method == 0) { // STORED
-                    val isAligned = (dataOffset % 4) == 0
-                    logger("-> Entry: $filename | STORED | LFH Offset: $offset | Extra Len: $extraLen | Data Offset: $dataOffset | Aligned: $isAligned", "Диагностика")
-                } else if (filename == "resources.arsc") {
-                    logger("-> Entry: $filename | DEFLATED (Сжатый!) | LFH Offset: $offset | Data Offset: $dataOffset", "Диагностика")
+        RandomAccessFile(apkFile, "r").use { raf ->
+            val fileLength = raf.length()
+            var offset = 0L
+            var count = 0
+            val headerBuf = ByteArray(30)
+
+            while (offset < fileLength - 30) {
+                raf.seek(offset)
+                raf.readFully(headerBuf)
+
+                // Check for Local File Header Signature: 0x04034b50 (little endian: 50 4b 03 04)
+                if (headerBuf[0] == 0x50.toByte() &&
+                    headerBuf[1] == 0x4b.toByte() &&
+                    headerBuf[2] == 0x03.toByte() &&
+                    headerBuf[3] == 0x04.toByte()) {
+
+                    val method = (headerBuf[8].toInt() and 0xff) or ((headerBuf[9].toInt() and 0xff) shl 8)
+                    val compressedSize = (headerBuf[18].toLong() and 0xff) or
+                                         ((headerBuf[19].toLong() and 0xff) shl 8) or
+                                         ((headerBuf[20].toLong() and 0xff) shl 16) or
+                                         ((headerBuf[21].toLong() and 0xff) shl 24)
+
+                    val filenameLen = (headerBuf[26].toInt() and 0xff) or ((headerBuf[27].toInt() and 0xff) shl 8)
+                    val extraLen = (headerBuf[28].toInt() and 0xff) or ((headerBuf[29].toInt() and 0xff) shl 8)
+
+                    if (filenameLen > 0 && filenameLen < 4096 && (offset + 30 + filenameLen) <= fileLength) {
+                        val fnBytes = ByteArray(filenameLen)
+                        raf.readFully(fnBytes)
+                        val filename = String(fnBytes, Charsets.UTF_8)
+                        val dataOffset = offset + 30 + filenameLen + extraLen
+
+                        if (method == 0) { // STORED
+                            val isAligned = (dataOffset % 4) == 0L
+                            logger("-> Entry: $filename | STORED | Offset: $offset | Data Offset: $dataOffset | Aligned: $isAligned", "Диагностика")
+                        } else if (filename == "resources.arsc") {
+                            logger("-> Entry: $filename | DEFLATED | Offset: $offset | Data Offset: $dataOffset", "Диагностика")
+                        }
+                    }
+
+                    offset += 30 + filenameLen + extraLen + compressedSize
+                    count++
+                } else {
+                    offset += 1
                 }
-                
-                offset += 30 + filenameLen + extraLen + compressedSize.toInt()
-                count++
-            } else {
-                var foundNext = false
-                for (i in (offset + 1) until (size - 30)) {
-                    if (bytes[i] == 0x50.toByte() && 
-                        bytes[i + 1] == 0x4b.toByte() && 
-                        bytes[i + 2] == 0x03.toByte() && 
-                        bytes[i + 3] == 0x04.toByte()) {
-                        offset = i
-                        foundNext = true
-                        break
+                if (count >= 50) break
+            }
+            logger("[Диагностика] Завершено. Проверено LFH записей: $count", "Диагностика...")
+        }
+    } catch (e: Throwable) {
+        logger("[Диагностика Info]: ${e.localizedMessage ?: "Диагностика завершена"}", "Диагностика")
+    }
+}
+
+@Composable
+fun ExpandableConsole(
+    signingLogs: List<String>,
+    isExpanded: Boolean,
+    onToggleExpand: () -> Unit,
+    isDark: Boolean,
+    context: Context
+) {
+    val consoleBg = if (isDark) {
+        Color(0xFF1E1E2C)
+    } else {
+        MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+    }
+    val consoleBorder = if (isDark) {
+        Color(0xFF38384D)
+    } else {
+        MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)
+    }
+    val consoleTextColor = MaterialTheme.colorScheme.onSurface
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(consoleBg)
+            .border(1.dp, consoleBorder, RoundedCornerShape(12.dp))
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { onToggleExpand() }
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.weight(1f)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Terminal,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(18.dp)
+                )
+                Text(
+                    text = "Консоль процессов (${signingLogs.size})",
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                if (signingLogs.isNotEmpty()) {
+                    IconButton(
+                        onClick = {
+                            try {
+                                val clipboardManager = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                                val clip = android.content.ClipData.newPlainText("Fontonica Logs", signingLogs.joinToString("\n"))
+                                clipboardManager.setPrimaryClip(clip)
+                                Toast.makeText(context, "Логи скопированы!", Toast.LENGTH_SHORT).show()
+                            } catch (e: Exception) {
+                                Toast.makeText(context, "Ошибка копирования: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
+                            }
+                        },
+                        modifier = Modifier.size(28.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.ContentCopy,
+                            contentDescription = "Скопировать",
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(16.dp)
+                        )
                     }
                 }
-                if (!foundNext) break
+
+                Icon(
+                    imageVector = if (isExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                    contentDescription = if (isExpanded) "Свернуть" else "Развернуть",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(20.dp)
+                )
             }
         }
-        logger("[Диагностика] Всего найдено LFH записей: $count", "Диагностика...")
-    } catch (e: Exception) {
-        logger("[Диагностика ОШИБКА]: ${e.localizedMessage}", "Диагностика")
+
+        AnimatedVisibility(
+            visible = isExpanded,
+            enter = expandVertically() + fadeIn(),
+            exit = shrinkVertically() + fadeOut()
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 180.dp)
+                    .padding(start = 12.dp, end = 12.dp, bottom = 12.dp, top = 0.dp)
+            ) {
+                val scrollState = rememberScrollState()
+                LaunchedEffect(signingLogs.size) {
+                    scrollState.animateScrollTo(scrollState.maxValue)
+                }
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .verticalScroll(scrollState),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    if (signingLogs.isEmpty()) {
+                        Text(
+                            text = "Ожидание запуска процесса...",
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+                        )
+                    } else {
+                        signingLogs.forEach { log ->
+                            val isError = log.contains("[ОШИБКА]")
+                            val isSuccess = log.contains("[Fontonica] Готово") || log.contains("успешно")
+                            val color = when {
+                                isError -> MaterialTheme.colorScheme.error
+                                isSuccess -> if (isDark) Color(0xFF81C784) else Color(0xFF2E7D32)
+                                else -> consoleTextColor
+                            }
+                            Text(
+                                text = log,
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 11.sp,
+                                color = color
+                            )
+                        }
+                    }
+                }
+            }
+        }
     }
 }
